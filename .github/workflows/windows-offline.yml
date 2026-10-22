@@ -28,8 +28,7 @@ jobs:
       - name: Restore source and assemble fully offline payload
         shell: pwsh
         run: |
-          # Child Windows PowerShell 5.1 must not inherit PowerShell 7 module paths.
-          # Keep Authenticode verification enabled; let the child resolve its own modules.
+          # Keep Authenticode verification enabled; avoid inheriting PS7 modules in PS5.
           Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
           python packaging/prepare.py
           if ($LASTEXITCODE -ne 0) { throw 'Payload preparation failed' }
@@ -62,11 +61,16 @@ jobs:
           if ($p.ExitCode -ne 0) { Get-Content "$infoPath.error.txt" -ErrorAction SilentlyContinue; throw 'EXE extraction failed' }
           $info = Get-Content $infoPath -Raw | ConvertFrom-Json
           $programs = @($exe, (Join-Path $info.root '.runtime/python.exe'), (Join-Path $info.root '.runtime/pythonw.exe'), (Join-Path $info.root 'webview2/msedgewebview2.exe'), (Join-Path $info.root 'tools/ffmpeg.exe'), (Join-Path $info.root 'tools/ffprobe.exe'))
+          # Block these programs on every connected non-loopback interface (IPv4/IPv6).
+          # Leave the loopback interface alone: the desktop UI uses a local HTTP server.
+          $interfaces = @(Get-NetIPInterface | Where-Object { $_.ConnectionState -eq 'Connected' -and $_.InterfaceAlias -notlike '*Loopback*' } | Select-Object -ExpandProperty InterfaceAlias -Unique)
+          if ($interfaces.Count -eq 0) { throw 'No connected non-loopback interface found; cannot verify isolation' }
+          Write-Output "Network-isolated interfaces: $($interfaces -join ', ')"
           $rules = @()
           try {
             foreach ($program in $programs) {
               $name = 'ClearFrame-CI-' + [guid]::NewGuid().ToString('N')
-              New-NetFirewallRule -DisplayName $name -Direction Outbound -Program $program -Action Block -RemoteAddress @('0.0.0.0-126.255.255.255','128.0.0.0-255.255.255.255','::/0') -Profile Any | Out-Null
+              New-NetFirewallRule -DisplayName $name -Direction Outbound -Program $program -Action Block -RemoteAddress Any -InterfaceAlias $interfaces -Profile Any | Out-Null
               $rules += $name
             }
             $env:CLEARFRAME_TEST_FIREWALL = '1'
@@ -93,11 +97,13 @@ jobs:
           Copy-Item LICENSE,THIRD_PARTY_NOTICES.md dist/
           $source = Join-Path $pwd 'build/source-release'
           New-Item -ItemType Directory -Force $source | Out-Null
-          Copy-Item -Recurse app,tests,scripts,licenses $source/
-          Copy-Item dependencies.lock.json,LICENSE,THIRD_PARTY_NOTICES.md $source/
-          Copy-Item -Recurse packaging $source/
+          Copy-Item -Recurse app,tests,scripts,licenses,source-transfer,packaging $source/
+          Copy-Item dependencies.lock.json,LICENSE,THIRD_PARTY_NOTICES.md,README.md $source/
+          New-Item -ItemType Directory -Force (Join-Path $source '.github/workflows') | Out-Null
+          Copy-Item .github/workflows/windows-offline.yml (Join-Path $source '.github/workflows/')
           Remove-Item (Join-Path $source 'packaging/launcher/payload.zip')
-          Compress-Archive -Path "$source/*" -DestinationPath dist/ClearFrame-source.zip
+          python -c "import pathlib,zipfile; root=pathlib.Path('build/source-release'); z=zipfile.ZipFile('dist/ClearFrame-source.zip','w',zipfile.ZIP_DEFLATED,strict_timestamps=False); [z.write(p,p.relative_to(root).as_posix()) for p in sorted(root.rglob('*')) if p.is_file() and '__pycache__' not in p.parts]; z.close()"
+          if ($LASTEXITCODE -ne 0) { throw 'Source packaging failed' }
           $hash = (Get-FileHash dist/ClearFrame.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  ClearFrame.exe" | Set-Content dist/SHA256SUMS.txt -Encoding utf8
           Write-Output "FINAL_EXE_BYTES=$((Get-Item dist/ClearFrame.exe).Length) SHA256=$hash"
