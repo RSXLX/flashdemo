@@ -100,6 +100,11 @@ def pypi_archive(item):
 
 def run(args, **kwargs):
     print('Run:', ' '.join(map(str,args)),flush=True)
+    # PowerShell 5.1 cannot load PowerShell 7's identically named built-in modules.
+    if Path(str(args[0])).name.lower() in ('powershell', 'powershell.exe'):
+        env = dict(kwargs.pop('env', os.environ))
+        env = {k:v for k,v in env.items() if k.upper() != 'PSMODULEPATH'}
+        kwargs['env'] = env
     return subprocess.run(list(map(str,args)),check=True,**kwargs)
 
 def prepare():
@@ -138,7 +143,7 @@ def prepare():
             if item.is_dir(): continue
             if parts[-1] in ('ffmpeg.exe','ffprobe.exe'):
                 (tools/parts[-1]).write_bytes(z.read(item))
-            elif len(parts)>1 and parts[1] in ('doc','licenses') or parts[-1].lower().startswith(('license','readme')):
+            elif (len(parts)>1 and parts[1] in ('doc','licenses')) or parts[-1].lower().startswith(('license','readme')):
                 dest = PAYLOAD/'licenses/ffmpeg'/Path(*parts[1:])
                 dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(z.read(item))
     # Ship the vendor's signed app-local CRT, not a system installer.
@@ -168,14 +173,17 @@ def prepare():
     icon_code = "import cv2,numpy as n,struct; from pathlib import Path; a=n.full((256,256,3),245,dtype=n.uint8); cv2.rectangle(a,(32,32),(224,224),(217,105,110),-1); cv2.rectangle(a,(78,64),(180,192),(255,255,255),9); b=cv2.imencode('.png',a)[1].tobytes(); Path('app/app.ico').write_bytes(struct.pack('<HHH',0,1,1)+struct.pack('<BBBBHHII',0,0,0,0,1,32,len(b),22)+b)"
     run([python,'-c',icon_code],cwd=PAYLOAD,env=env)
     run([python,PAYLOAD/'scripts/generate_sample.py','--output',PAYLOAD/'samples','--seconds','6'],cwd=PAYLOAD,env=env)
-    run([tools/'ffmpeg.exe','-buildconf'],stdout=open(PAYLOAD/'licenses/FFMPEG_BUILD_CONFIGURATION.txt','w'),stderr=subprocess.STDOUT)
+    with open(PAYLOAD/'licenses/FFMPEG_BUILD_CONFIGURATION.txt','w') as log:
+        run([tools/'ffmpeg.exe','-buildconf'],stdout=log,stderr=subprocess.STDOUT)
     (PAYLOAD/'build-provenance.json').write_text(json.dumps({'version':'3.1.0','webview_version':WEBVIEW_VERSION,'source_sha256':SOURCE_SHA,'components':PROVENANCE},indent=2),encoding='utf-8')
     # Manifest lists every payload file, including all DLLs and UI assets.
     files = {p.relative_to(PAYLOAD).as_posix():digest(p) for p in PAYLOAD.rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix!='.pyc' and p.name!='manifest.json'}
     (PAYLOAD/'manifest.json').write_text(json.dumps(files,sort_keys=True),encoding='utf-8')
     target=ROOT/'packaging/launcher/payload.zip'; target.parent.mkdir(parents=True,exist_ok=True)
-    with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=5) as z:
-        for name in files: z.write(PAYLOAD/name,name)
+    # Reproducible source tar files may deliberately use Unix epoch timestamps.
+    # ZIP supports dates beginning in 1980; clamp metadata, not file contents.
+    with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=5,strict_timestamps=False) as z:
+        for name in sorted(files): z.write(PAYLOAD/name,name)
         z.write(PAYLOAD/'manifest.json','manifest.json')
     print('PAYLOAD_BYTES',target.stat().st_size,'SHA256',digest(target),flush=True)
     shutil.copy2(PAYLOAD/'build-provenance.json',ROOT/'build/build-provenance.json')
