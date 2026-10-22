@@ -28,6 +28,9 @@ jobs:
       - name: Restore source and assemble fully offline payload
         shell: pwsh
         run: |
+          # Child Windows PowerShell 5.1 must not inherit PowerShell 7 module paths.
+          # Keep Authenticode verification enabled; let the child resolve its own modules.
+          Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
           python packaging/prepare.py
           if ($LASTEXITCODE -ne 0) { throw 'Payload preparation failed' }
       - name: Native launcher tests and build
