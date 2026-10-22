@@ -1,0 +1,122 @@
+name: Windows offline single EXE
+on:
+  push:
+    branches: [build/windows-offline]
+    paths-ignore: ['README.md', 'docs/**']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: clearframe-offline-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      - name: Restore source and assemble fully offline payload
+        shell: pwsh
+        run: |
+          python packaging/prepare.py
+          if ($LASTEXITCODE -ne 0) { throw 'Payload preparation failed' }
+      - name: Native launcher tests and build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Push-Location packaging/launcher
+          go test -v . 2>&1 | Tee-Object ../../build/launcher-tests.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher tests failed' }
+          go build -trimpath -ldflags='-H windowsgui -s -w' -o ../../dist/ClearFrame.exe .
+          if ($LASTEXITCODE -ne 0) { throw 'Native EXE compilation failed' }
+          Pop-Location
+      - name: Original application regression suite on Windows
+        shell: pwsh
+        run: |
+          $env:CLEARFRAME_TEST_EXE = (Resolve-Path dist/ClearFrame.exe).Path
+          Push-Location build/payload
+          & ./.runtime/python.exe -m unittest discover -s tests -v 2>&1 | Tee-Object ../python-tests.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Application regression tests failed' }
+          Pop-Location
+      - name: Test final EXE with outbound network blocked
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = (Resolve-Path dist/ClearFrame.exe).Path
+          $infoPath = Join-Path $pwd 'build/extracted.json'
+          $p = Start-Process $exe -ArgumentList @('--extract-only', "`"$infoPath`"") -PassThru
+          if (-not $p.WaitForExit(600000)) { $p.Kill(); throw 'EXE extraction timed out' }
+          if ($p.ExitCode -ne 0) { Get-Content "$infoPath.error.txt" -ErrorAction SilentlyContinue; throw 'EXE extraction failed' }
+          $info = Get-Content $infoPath -Raw | ConvertFrom-Json
+          $programs = @($exe, (Join-Path $info.root '.runtime/python.exe'), (Join-Path $info.root '.runtime/pythonw.exe'), (Join-Path $info.root 'webview2/msedgewebview2.exe'), (Join-Path $info.root 'tools/ffmpeg.exe'), (Join-Path $info.root 'tools/ffprobe.exe'))
+          $rules = @()
+          try {
+            foreach ($program in $programs) {
+              $name = 'ClearFrame-CI-' + [guid]::NewGuid().ToString('N')
+              New-NetFirewallRule -DisplayName $name -Direction Outbound -Program $program -Action Block -RemoteAddress @('0.0.0.0-126.255.255.255','128.0.0.0-255.255.255.255','::/0') -Profile Any | Out-Null
+              $rules += $name
+            }
+            $env:CLEARFRAME_TEST_FIREWALL = '1'
+            $report = Join-Path $pwd 'build/offline-report.json'
+            $p = Start-Process $exe -ArgumentList @('--self-test', "`"$report`"") -PassThru
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); throw 'Offline EXE self-test timed out' }
+            Get-Content $report -ErrorAction SilentlyContinue
+            if ($p.ExitCode -ne 0) {
+              Get-Content (Join-Path $info.data 'logs/launcher.log') -ErrorAction SilentlyContinue
+              Get-Content (Join-Path $pwd 'build/offline-report.gui.log') -ErrorAction SilentlyContinue
+              throw 'Offline EXE self-test failed'
+            }
+            $result = Get-Content $report -Raw | ConvertFrom-Json
+            if (-not $result.ok) { throw 'Offline report did not pass' }
+          } finally {
+            foreach ($name in $rules) { Remove-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue }
+            Remove-Item Env:CLEARFRAME_TEST_FIREWALL -ErrorAction SilentlyContinue
+          }
+      - name: Package reports, readable source and hashes
+        shell: pwsh
+        run: |
+          Copy-Item packaging/OFFLINE_README.md dist/README.md
+          Copy-Item build/build-provenance.json,build/offline-report.json,build/launcher-tests.txt,build/python-tests.txt dist/
+          Copy-Item LICENSE,THIRD_PARTY_NOTICES.md dist/
+          $source = Join-Path $pwd 'build/source-release'
+          New-Item -ItemType Directory -Force $source | Out-Null
+          Copy-Item -Recurse app,tests,scripts,licenses $source/
+          Copy-Item dependencies.lock.json,LICENSE,THIRD_PARTY_NOTICES.md $source/
+          Copy-Item -Recurse packaging $source/
+          Remove-Item (Join-Path $source 'packaging/launcher/payload.zip')
+          Compress-Archive -Path "$source/*" -DestinationPath dist/ClearFrame-source.zip
+          $hash = (Get-FileHash dist/ClearFrame.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ClearFrame.exe" | Set-Content dist/SHA256SUMS.txt -Encoding utf8
+          Write-Output "FINAL_EXE_BYTES=$((Get-Item dist/ClearFrame.exe).Length) SHA256=$hash"
+      - name: Upload executable and verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClearFrame-Windows-Offline-${{ github.run_number }}
+          path: |
+            dist/*
+            build/*-tests.txt
+            build/offline-report*
+            build/extracted.json*
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
+      - name: Publish verified prerelease
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v3.1.0-offline-build-${{ github.run_number }}'
+          gh release create $tag dist/ClearFrame.exe dist/SHA256SUMS.txt dist/offline-report.json dist/ClearFrame-source.zip dist/build-provenance.json dist/README.md --target '${{ github.sha }}' --title 'ClearFrame 3.1 Offline - Windows x64' --prerelease --notes-file packaging/OFFLINE_README.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
