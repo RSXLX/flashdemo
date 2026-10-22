@@ -88,6 +88,14 @@ def patch_source():
     s = p.read_text(encoding='utf-8')
     s = s.replace("(ROOT/'ClearFrame.exe').read_bytes()", "Path(__import__('os').environ.get('CLEARFRAME_TEST_EXE', str(ROOT/'ClearFrame.exe'))).read_bytes()")
     p.write_text(s,encoding='utf-8')
+    # Windows TEMP may use RUNNER~1 while the app correctly stores canonical paths.
+    # Compare the actual resolved directory on both sides, retaining the assertion.
+    p = ROOT/'tests/test_simple3.py'
+    s = p.read_text(encoding='utf-8')
+    old = "self.assertEqual(Path(r['output']).parent,folder)"
+    if old not in s: raise RuntimeError('Output-directory test patch target changed')
+    s = s.replace(old, "self.assertEqual(Path(r['output']).parent.resolve(),folder.resolve())")
+    p.write_text(s,encoding='utf-8')
 
 def pypi_archive(item):
     url = f"https://pypi.org/pypi/{item['project']}/{item['version']}/json"
